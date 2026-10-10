@@ -224,6 +224,25 @@ static void update_advertising_callback(struct k_work *work) { update_advertisin
 
 K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
 
+/*
+ * With CONFIG_BT_EXT_ADV the host delivers the peripheral connection complete
+ * from inside bt_hci_le_adv_set_terminated(), and deletes the legacy advertiser
+ * (bt_le_adv_delete_legacy) right after the connected callbacks return because
+ * ZMK_ADV_CONN_NAME is ONE_TIME. Restarting advertising synchronously from
+ * connected() therefore re-enables the very set the host is about to forget:
+ * the controller keeps advertising on a handle nobody owns, every later
+ * bt_le_adv_start()/bt_le_ext_adv_create() on that handle fails with
+ * Command Disallowed (-EIO), and a central that connects through the orphaned
+ * set is never registered by the host.
+ *
+ * Deferring the restart past the terminated event fixes the ordering. The
+ * delay must be non-zero: the system workqueue runs at a cooperative priority
+ * above the Bluetooth RX thread, so a plain k_work_submit() would execute the
+ * restart immediately, before the event handler finishes.
+ */
+#define CONNECTED_ADV_RESTART_DELAY_MS 10
+K_WORK_DELAYABLE_DEFINE(deferred_advertising_work, update_advertising_callback);
+
 static void clear_profile_bond(uint8_t profile) {
     if (bt_addr_le_cmp(&profiles[profile].peer, BT_ADDR_LE_ANY)) {
         bt_unpair(BT_ID_DEFAULT, &profiles[profile].peer);
@@ -515,13 +534,13 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     if (err) {
         LOG_WRN("Failed to connect to %s (%u)", addr, err);
-        update_advertising();
+        k_work_reschedule(&deferred_advertising_work, K_MSEC(CONNECTED_ADV_RESTART_DELAY_MS));
         return;
     }
 
     LOG_DBG("Connected %s", addr);
 
-    update_advertising();
+    k_work_reschedule(&deferred_advertising_work, K_MSEC(CONNECTED_ADV_RESTART_DELAY_MS));
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile connected");
